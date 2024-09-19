@@ -1,0 +1,148 @@
+name: frappe
+
+services:
+  web:
+    image: frappe/bench
+    depends_on:
+      setup-site:
+        condition: service_completed_successfully
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    healthcheck:
+      test: curl --fail http://web:8000 || exit 1
+      interval: 3s
+      timeout: 1s
+      retries: 10
+    restart: unless-stopped
+
+  websocket:
+    image: frappe/bench
+    depends_on:
+      setup-site:
+        condition: service_completed_successfully
+    healthcheck:
+      test: curl http://websocket:9000 || exit 1
+      interval: 3s
+      timeout: 1s
+      retries: 10
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    restart: unless-stopped
+    command: node /home/frappe/frappe-bench/apps/frappe/socketio.js
+
+  nginx:
+    image: nginx:alpine
+    depends_on:
+      web:
+        condition: service_healthy
+      websocket:
+        condition: service_healthy
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/frappe.conf
+      - sites:/sites
+    ports:
+      - 80:8000
+
+  db:
+    image: mariadb:10.6
+    volumes:
+      - db:/var/lib/mysql
+    healthcheck:
+      test: mysqladmin ping -h localhost --password="${MYSQL_ROOT_PASSWORD}"
+      interval: 1s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+    env_file: .env
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --skip-innodb-read-only-compressed
+
+  queue:
+    image: redis:alpine
+    volumes:
+      - queue:/data
+    healthcheck:
+      test: "redis-cli ping"
+      interval: 1s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
+  cache:
+    image: redis:alpine
+    volumes:
+      - cache:/data
+    healthcheck:
+      test: "redis-cli ping"
+      interval: 1s
+      retries: 15
+    restart: unless-stopped
+
+  worker-long:
+    image: frappe/bench
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      queue:
+        condition: service_healthy
+    restart: unless-stopped
+    command: bench worker --queue long,default,short
+
+  worker-short:
+    image: frappe/bench
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      queue:
+        condition: service_healthy
+    restart: unless-stopped
+    command: bench worker --queue default,short
+
+  scheduler:
+    image: frappe/bench
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      queue:
+        condition: service_healthy
+    restart: unless-stopped
+    command: bench schedule
+
+  setup-site:
+    image: frappe/bench
+    depends_on:
+      db:
+        condition: service_healthy
+      queue:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    restart: no
+    env_file: .env
+    command: bash -c "
+      ls -1 apps > sites/apps.txt;
+      bench set-config -g db_host db;
+      bench set-config -gp db_port 3306;
+      bench set-config -g redis_cache 'redis://cache:6379';
+      bench set-config -g redis_queue 'redis://queue:6379';
+      bench set-config -g redis_socketio 'redis://queue:6379';
+      bench new-site --no-mariadb-socket --admin-password='${ADMIN_PASSWORD}' --db-root-password='${MYSQL_ROOT_PASSWORD}' --set-default web;
+      bench install-app $(cat sites/apps.txt);"
+
+volumes:
+  db:
+  queue:
+  cache:
+  sites:
+  logs:
